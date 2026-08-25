@@ -1,0 +1,403 @@
+#!/usr/bin/env python3
+"""Inspect the actual filesystem and IPC visibility of running Proton games."""
+
+from __future__ import annotations
+
+import argparse
+import curses
+import json
+import os
+import re
+import sys
+from dataclasses import asdict, dataclass
+from pathlib import Path
+
+
+PROC = Path("/proc")
+
+
+@dataclass
+class Process:
+    pid: int
+    command: str
+    app_id: str | None
+    game_name: str | None
+
+
+@dataclass
+class PathStatus:
+    path: str
+    visible: bool
+    mount_point: str | None
+    source: str
+
+
+def read_environ(pid: int, proc: Path = PROC) -> dict[str, str]:
+    try:
+        raw = (proc / str(pid) / "environ").read_bytes()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return {}
+
+    values: dict[str, str] = {}
+    for entry in raw.split(b"\0"):
+        key, separator, value = entry.partition(b"=")
+        if separator:
+            values[key.decode(errors="replace")] = value.decode(errors="replace")
+    return values
+
+
+def command_for(pid: int, proc: Path = PROC) -> str:
+    try:
+        command = (proc / str(pid) / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
+        return command or (proc / str(pid) / "comm").read_text().strip()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return "<unavailable>"
+
+
+def app_id_for(environment: dict[str, str]) -> str | None:
+    for key in ("SteamGameId", "SteamAppId", "STEAM_COMPAT_APP_ID"):
+        value = environment.get(key)
+        if value and value.isdigit() and value != "0":
+            return value
+    return None
+
+
+def steam_library_paths() -> list[Path]:
+    roots = [
+        Path.home() / ".steam/steam",
+        Path.home() / ".steam/debian-installation",
+        Path.home() / ".local/share/Steam",
+    ]
+    libraries: set[Path] = set()
+    for root in roots:
+        steamapps = root / "steamapps"
+        if steamapps.is_dir():
+            libraries.add(steamapps)
+        library_file = steamapps / "libraryfolders.vdf"
+        if not library_file.is_file():
+            continue
+        for path in re.findall(r'"path"\s+"([^"]+)"', library_file.read_text(errors="replace")):
+            libraries.add(Path(path.replace("\\\\", "\\")) / "steamapps")
+    return sorted(libraries)
+
+
+def steam_game_names(libraries: list[Path] | None = None) -> dict[str, str]:
+    names: dict[str, str] = {}
+    for library in libraries if libraries is not None else steam_library_paths():
+        for manifest in library.glob("appmanifest_*.acf"):
+            match = re.search(r'"appid"\s+"(\d+)".*?"name"\s+"([^"]+)"', manifest.read_text(errors="replace"), re.DOTALL)
+            if match:
+                names[match.group(1)] = match.group(2)
+    return names
+
+
+def proton_processes(proc: Path = PROC, game_names: dict[str, str] | None = None) -> list[Process]:
+    processes: list[Process] = []
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        environment = read_environ(pid, proc)
+        app_id = app_id_for(environment)
+        if not app_id:
+            continue
+        command = command_for(pid, proc)
+        if any(marker in command.lower() for marker in ("wine", "proton", "pressure-vessel", "steam-runtime")):
+            processes.append(Process(pid, command, app_id, (game_names or {}).get(app_id)))
+    return processes
+
+
+def unescape_mount_path(path: str) -> str:
+    return path.replace("\\040", " ").replace("\\011", "\t").replace("\\012", "\n").replace("\\134", "\\")
+
+
+def mounts_for(pid: int, proc: Path = PROC) -> list[tuple[str, str]]:
+    try:
+        lines = (proc / str(pid) / "mountinfo").read_text().splitlines()
+    except (FileNotFoundError, PermissionError, ProcessLookupError):
+        return []
+
+    mounts: list[tuple[str, str]] = []
+    for line in lines:
+        left, separator, right = line.partition(" - ")
+        fields = left.split()
+        right_fields = right.split()
+        if not separator or len(fields) < 5 or len(right_fields) < 2:
+            continue
+        mounts.append((unescape_mount_path(fields[4]), right_fields[1]))
+    return mounts
+
+
+def containing_mount(path: str, mounts: list[tuple[str, str]]) -> str | None:
+    candidates = [mount for mount, _source in mounts if path == mount or path.startswith(mount.rstrip("/") + "/")]
+    return max(candidates, key=len) if candidates else None
+
+
+def expand_mount_list(value: str, environment: dict[str, str]) -> list[str]:
+    def replace(match: re.Match[str]) -> str:
+        key = match.group(1) or match.group(2)
+        return environment.get(key, match.group(0))
+
+    expanded = re.sub(r"\$(?:{([^}]+)}|([A-Za-z_][A-Za-z0-9_]*))", replace, value)
+    return [path for path in expanded.split(":") if path.startswith("/")]
+
+
+def candidate_paths(environment: dict[str, str]) -> list[tuple[str, str]]:
+    runtime = environment.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    candidates = [
+        (f"{runtime}/discord-ipc-0", "Discord IPC"),
+        (f"{runtime}/app/com.discordapp.Discord/discord-ipc-0", "Flatpak Discord IPC"),
+        ("/dev/input", "controllers"),
+        ("/dev/dri", "GPU devices"),
+    ]
+    for variable in ("PRESSURE_VESSEL_FILESYSTEMS_RW", "PRESSURE_VESSEL_FILESYSTEMS_RO"):
+        for path in expand_mount_list(environment.get(variable, ""), environment):
+            candidates.append((path, variable))
+    return candidates
+
+
+def inspect(pid: int, proc: Path = PROC) -> dict[str, object]:
+    environment = read_environ(pid, proc)
+    if not environment:
+        raise RuntimeError(f"Cannot read environment for PID {pid}; is it still running?")
+
+    root = proc / str(pid) / "root"
+    mounts = mounts_for(pid, proc)
+    statuses: list[PathStatus] = []
+    seen: set[str] = set()
+    for path, source in candidate_paths(environment):
+        if path in seen:
+            continue
+        seen.add(path)
+        statuses.append(PathStatus(
+            path=path,
+            visible=os.path.lexists(root / path.lstrip("/")),
+            mount_point=containing_mount(path, mounts),
+            source=source,
+        ))
+
+    return {
+        "pid": pid,
+        "command": command_for(pid, proc),
+        "app_id": app_id_for(environment),
+        "runtime": environment.get("STEAM_RUNTIME", "host or unspecified"),
+        "pressure_vessel": environment.get("PRESSURE_VESSEL_RUNTIME", "not set"),
+        "mount_count": len(mounts),
+        "mounts": [{"path": path, "source": source} for path, source in mounts],
+        "paths": [asdict(status) for status in statuses],
+        "environment": {
+            key: environment[key]
+            for key in sorted(environment)
+            if key.startswith(("PRESSURE_VESSEL_", "STEAM_COMPAT_", "PROTON_"))
+            or key in {"SteamGameId", "SteamAppId", "XDG_RUNTIME_DIR"}
+        },
+    }
+
+
+def report_lines(report: dict[str, object], sections: set[str] | None = None) -> list[str]:
+    sections = sections or {"all"}
+    show_all = "all" in sections
+    lines = [f"PID: {report['pid']}"]
+    app_id = report['app_id'] or 'unknown'
+    game_name = steam_game_names().get(str(app_id))
+    lines.extend((
+        f"Game: {game_name or 'Unknown Steam game'} ({app_id})",
+        f"Command: {report['command']}",
+        f"Mounts: {report['mount_count']}",
+    ))
+    statuses = report["paths"]  # type: ignore[assignment]
+    if show_all or "checks" in sections:
+        lines.extend(("", "Checks:"))
+        discord_visible = any(status["visible"] for status in statuses if "Discord IPC" in status["source"])
+        gpu_visible = any(status["visible"] for status in statuses if status["source"] == "GPU devices")
+        controller_visible = any(status["visible"] for status in statuses if status["source"] == "controllers")
+        lines.append(f"  [{'OK' if discord_visible else 'NO'}] Discord socket {'is available' if discord_visible else 'is not available in the container'}.")
+        if not discord_visible:
+            lines.append("     Start Discord first. If it is already open, mount its socket with PRESSURE_VESSEL_FILESYSTEMS_RW.")
+        lines.append(f"  [{'OK' if gpu_visible else 'NO'}] GPU devices {'are available' if gpu_visible else 'are not visible'}.")
+        lines.append(f"  [{'OK' if controller_visible else 'INFO'}] Controller devices {'are available' if controller_visible else 'are not visible'}.")
+
+    if show_all or "paths" in sections:
+        lines.extend(("", "Visible paths:"))
+        for status in statuses:
+            marker = "OK" if status["visible"] else "NO"
+            mount = status["mount_point"] or "no matching mount"
+            lines.append(f"  [{marker:7}] {status['path']} ({status['source']}; {mount})")
+
+    if show_all or "environment" in sections:
+        environment = report["environment"]  # type: ignore[assignment]
+        if environment:
+            lines.extend(("", "Relevant environment:"))
+            for key, value in environment.items():
+                lines.append(f"  {key}={value}")
+
+    if show_all or "mounts" in sections:
+        lines.extend(("", "Mount points:"))
+        for mount in report["mounts"]:  # type: ignore[index]
+            lines.append(f"  {mount['path']} <- {mount['source']}")
+    return lines
+
+
+def print_report(report: dict[str, object], sections: set[str] | None = None) -> None:
+    print("\n".join(report_lines(report, sections)))
+
+
+def menu_selection(screen: curses.window, title: str, hint: str, items: list[str]) -> int | str | None:
+    selected = 0
+    curses.curs_set(0)
+    screen.keypad(True)
+    while True:
+        screen.clear()
+        height, width = screen.getmaxyx()
+        screen.addnstr(0, 0, title, max(0, width - 1), curses.A_BOLD)
+        screen.addnstr(1, 0, hint, max(0, width - 1))
+        for index, line in enumerate(items):
+            attribute = curses.A_REVERSE if index == selected else curses.A_NORMAL
+            if index + 3 < height:
+                screen.addnstr(index + 3, 0, line, max(0, width - 1), attribute)
+        screen.refresh()
+        key = screen.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            selected = (selected - 1) % len(items)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            selected = (selected + 1) % len(items)
+        elif key in (curses.KEY_ENTER, ord("\n"), ord("\r")):
+            return selected
+        elif key in (27, ord("b"), ord("B")):
+            return "back"
+        elif key in (3, ord("q"), ord("Q")):
+            return None
+
+
+def one_process_per_game(processes: list[Process]) -> list[Process]:
+    games: dict[str, Process] = {}
+    for process in processes:
+        if process.app_id:
+            games[process.app_id] = process
+    return list(games.values())
+
+
+def view_report(screen: curses.window, lines: list[str]) -> str:
+    offset = 0
+    screen.keypad(True)
+    while True:
+        screen.clear()
+        height, width = screen.getmaxyx()
+        usable_height = max(1, height - 2)
+        screen.addnstr(0, 0, "Report", max(0, width - 1), curses.A_BOLD)
+        screen.addnstr(1, 0, "Up/Down: scroll   B/Esc: back   Q/Ctrl-C: quit", max(0, width - 1))
+        for row, line in enumerate(lines[offset:offset + usable_height], start=2):
+            screen.addnstr(row, 0, line, max(0, width - 1))
+        screen.refresh()
+        key = screen.getch()
+        if key in (curses.KEY_UP, ord("k")):
+            offset = max(0, offset - 1)
+        elif key in (curses.KEY_DOWN, ord("j")):
+            offset = min(max(0, len(lines) - usable_height), offset + 1)
+        elif key == curses.KEY_PPAGE:
+            offset = max(0, offset - usable_height)
+        elif key == curses.KEY_NPAGE:
+            offset = min(max(0, len(lines) - usable_height), offset + usable_height)
+        elif key in (27, ord("b"), ord("B")):
+            return "back"
+        elif key in (3, ord("q"), ord("Q")):
+            return "quit"
+
+
+def interactive_inspector(screen: curses.window, processes: list[Process]) -> int:
+    games = one_process_per_game(processes)
+    choices = [
+        ("All", "all"),
+        ("Checks", "checks"),
+        ("Paths", "paths"),
+        ("Environment", "environment"),
+        ("Mount points", "mounts"),
+    ]
+    while True:
+        selected_game = menu_selection(
+            screen,
+            "Proton Vessel Inspector",
+            "Up/Down: select   Enter: inspect   Q: quit",
+            [f"{process.game_name or 'Unknown game'}  [{process.app_id}]" for process in games],
+        )
+        if not isinstance(selected_game, int):
+            return 0
+        game = games[selected_game]
+        while True:
+            selected_section = menu_selection(
+                screen,
+                f"{game.game_name or 'Steam app'}: choose information",
+                "Up/Down: select   Enter: show   Esc/B: games   Q: quit",
+                [label for label, _value in choices],
+            )
+            if selected_section is None:
+                return 0
+            if selected_section == "back":
+                break
+            try:
+                report = inspect(game.pid)
+            except RuntimeError:
+                return 1
+            action = view_report(screen, report_lines(report, {choices[selected_section][1]}))
+            if action == "quit":
+                return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Inspect a running Proton game's container.")
+    parser.add_argument("--json", action="store_true", help="print JSON")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("list", help="show running Proton games")
+    inspect_parser = subparsers.add_parser("inspect", help="inspect a Proton game")
+    target = inspect_parser.add_mutually_exclusive_group(required=True)
+    target.add_argument("--pid", type=int, help="process ID to inspect")
+    target.add_argument("--app", help="Steam app ID to inspect")
+    args = parser.parse_args()
+
+    names = steam_game_names()
+    processes = proton_processes(game_names=names)
+    if args.command is None:
+        if not processes:
+            print("No Proton game is running. Start one in Steam, then run this again.")
+            return 1
+        if not sys.stdin.isatty():
+            print("Use `inspect --app <Steam app ID>` outside an interactive terminal.", file=sys.stderr)
+            return 1
+        try:
+            return curses.wrapper(interactive_inspector, processes)
+        except KeyboardInterrupt:
+            return 0
+        except curses.error:
+            print("This terminal cannot display the inspector. Use `inspect --app <Steam app ID>`.", file=sys.stderr)
+            return 1
+    if args.command == "list":
+        if args.json:
+            print(json.dumps([asdict(process) for process in processes], indent=2))
+        elif processes:
+            for process in one_process_per_game(processes):
+                print(f"{process.app_id:>8}  {process.pid:>7}  {process.game_name or 'Unknown game'}")
+        else:
+            print("No running Proton game processes found.")
+        return 0
+
+    if args.app:
+        matches = [process for process in processes if process.app_id == args.app]
+        if not matches:
+            parser.error(f"no running Proton process found for Steam app {args.app}")
+        pid = matches[-1].pid
+    else:
+        pid = args.pid
+
+    try:
+        report = inspect(pid)
+    except RuntimeError as error:
+        parser.error(str(error))
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print_report(report)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
